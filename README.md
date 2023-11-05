@@ -8,14 +8,14 @@
 externally of the game. This enables more stable mod usage as well as offline mod usage. Works for
 both Steam and Microsoft Store versions.
 
-<img alt="Graphical User Interface" src="https://github.com/jieyouxu/drg-mod-integration/assets/39484203/a09700f6-1932-4bc0-a64c-0f4e0d2faf53">
+![Graphical User Interface](https://github.com/jieyouxu/drg-mod-integration/assets/39484203/a09700f6-1932-4bc0-a64c-0f4e0d2faf53)
 
 Mods are added via URL to a .pak or .zip containing a .pak. Mods can also be pulled from mod.io.
 Examples:
 
- - `C:\Path\To\Local\Mod.zip`
- - `https://example.org/some-online-mod-repository/public-mod.pak`
- - `https://mod.io/g/drg/m/sandbox-utilities`
+- `C:\Path\To\Local\Mod.zip`
+- `https://example.org/some-online-mod-repository/public-mod.pak`
+- `https://mod.io/g/drg/m/sandbox-utilities`
 
 Mods from mod.io will require an OAuth token which can be obtained from <https://mod.io/me/access>
 when prompted.
@@ -30,13 +30,11 @@ official integration, *please* create an
 
 ## Usage
 
-This section assumes that you are on Windows and is using the steam version of DRG, working with
+This section assumes that you are on Windows and using the Steam version of DRG, working with
 either local `.pak`s or mod.io mods.
 
-First, download the [latest release](https://github.com/trumank/drg-mod-integration/releases/latest)
-compatible with your architecture. For windows, this will be the
-`drg_mod_integration-x86_64-pc-windows-msvc.zip`. Extract this to anywhere you'd like to keep the
-executable.
+First, download the [latest release](https://github.com/Strappazzon/drg-mod-integration/releases/latest).
+Extract this to anywhere you'd like to keep the executable.
 
 Then, we'll need to perform some first-time setup.
 
@@ -46,7 +44,7 @@ We need to provide the tool with the path to `FSD-WindowsNoEditor.pak` and a mod
 you want to use mod.io mods. These can be configured in the settings menu (cogwheel located in the
 bottom toolbar).
 
-<img alt="Settings menu" src="https://github.com/jieyouxu/drg-mod-integration/assets/39484203/09d12b01-7d2d-449e-97bb-47e4b4cdd301">
+![Settings menu](https://github.com/jieyouxu/drg-mod-integration/assets/39484203/09d12b01-7d2d-449e-97bb-47e4b4cdd301)
 
 #### Locating the DRG `FSD-WindowsNoEditor.pak`
 
@@ -55,7 +53,7 @@ If the tool fails to detect your DRG installation, then you can manually browse 
 
 This file is located under the `FSD` folder inside your DRG installation directory, e.g.
 
-```
+```plaintext
 E:\SteamLibrary\steamapps\common\Deep Rock Galactic\FSD\FSD-WindowsNoEditor.pak
 ```
 
@@ -67,7 +65,7 @@ for an mod.io OAuth token.
 To generate a mod.io OAuth token, you'll need to visit <https://mod.io/me/access>. You'll need to
 accept the API terms and conditions.
 
-<img alt="mod.io Access page" src="https://github.com/jieyouxu/drg-mod-integration/assets/39484203/67096a62-8a3d-46f3-a106-cf6c5066e296">
+![mod.io Access page](https://github.com/jieyouxu/drg-mod-integration/assets/39484203/67096a62-8a3d-46f3-a106-cf6c5066e296)
 
 Then, you'll need to add a new client under OAuth Access, call it e.g. "DRG Mod Integration".
 

@@ -1,8 +1,8 @@
 [package]
-name = "drg_mod_integration"
-version = "0.2.10"
+name = "drg_mod_integration_notag"
+version = "0.2.10-notag"
 edition = "2021"
-repository = "https://github.com/trumank/drg-mod-integration"
+repository = "https://github.com/Strappazzon/drg-mod-integration_notag"
 
 [features]
 default = ["hook"]

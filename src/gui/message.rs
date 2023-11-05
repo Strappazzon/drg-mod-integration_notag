@@ -333,9 +333,9 @@ impl CheckUpdates {
 
         async fn req() -> Result<GitHubRelease> {
             Ok(reqwest::Client::builder()
-                .user_agent("trumank/drg-mod-integration")
+                .user_agent("Strappazzon/drg-mod-integration_notag")
                 .build()?
-                .get("https://api.github.com/repos/trumank/drg-mod-integration/releases/latest")
+                .get("https://api.github.com/repos/Strappazzon/drg-mod-integration_notag/releases/latest")
                 .send()
                 .await?
                 .json::<GitHubRelease>()
@@ -672,7 +672,7 @@ async fn self_update_async(
 
     let response = client
         .get(format!(
-            "https://github.com/trumank/drg-mod-integration/releases/latest/download/{asset_name}"
+            "https://github.com/Strappazzon/drg-mod-integration_notag/releases/latest/download/{asset_name}"
         ))
         .send()
         .await?

@@ -8,7 +8,7 @@
 externally of the game. This enables more stable mod usage as well as offline mod usage. Works for
 both Steam and Microsoft Store versions.
 
-![Graphical User Interface](https://github.com/jieyouxu/drg-mod-integration/assets/39484203/a09700f6-1932-4bc0-a64c-0f4e0d2faf53)
+![Graphical User Interface](https://raw.githubusercontent.com/Strappazzon/drg-mod-integration_notag/master/assets/screenshots/gui.png)
 
 Mods are added via URL to a .pak or .zip containing a .pak. Mods can also be pulled from mod.io.
 Examples:
@@ -44,7 +44,7 @@ We need to provide the tool with the path to `FSD-WindowsNoEditor.pak` and a mod
 you want to use mod.io mods. These can be configured in the settings menu (cogwheel located in the
 bottom toolbar).
 
-![Settings menu](https://github.com/jieyouxu/drg-mod-integration/assets/39484203/09d12b01-7d2d-449e-97bb-47e4b4cdd301)
+![Settings](https://raw.githubusercontent.com/Strappazzon/drg-mod-integration_notag/master/assets/screenshots/gui_settings.png)
 
 #### Locating the DRG `FSD-WindowsNoEditor.pak`
 

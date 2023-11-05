@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use drg_mod_integration::mod_lints::{LintId, LintReport, SplitAssetPair};
-use drg_mod_integration::providers::ModSpecification;
+use drg_mod_integration_notag::mod_lints::{LintId, LintReport, SplitAssetPair};
+use drg_mod_integration_notag::providers::ModSpecification;
 
 #[test]
 pub fn test_lint_conflicting_files() {

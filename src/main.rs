@@ -9,10 +9,10 @@ use tracing::{debug, info};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::filter;
 
-use drg_mod_integration::mod_lints::{run_lints, LintId};
-use drg_mod_integration::providers::ProviderFactory;
-use drg_mod_integration::{gui::gui, providers::ModSpecification, state::State, DRGInstallation};
-use drg_mod_integration::{
+use drg_mod_integration_notag::mod_lints::{run_lints, LintId};
+use drg_mod_integration_notag::providers::ProviderFactory;
+use drg_mod_integration_notag::{gui::gui, providers::ModSpecification, state::State, DRGInstallation};
+use drg_mod_integration_notag::{
     resolve_ordered_with_provider_init, resolve_unordered_and_integrate_with_provider_init, Dirs,
 };
 

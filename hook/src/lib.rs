@@ -378,7 +378,7 @@ fn get_server_name_detour(a: *const c_void, b: *const c_void) -> *const FString 
     unsafe {
         let name: *mut FString = GetServerName.call(a, b) as *mut _;
 
-        let prefix = "[MODDED] ".encode_utf16().collect::<Vec<_>>();
+        let prefix = "".encode_utf16().collect::<Vec<_>>();
         let old_num = (*name).num;
 
         let new_num = (*name).num + prefix.len() as i32;

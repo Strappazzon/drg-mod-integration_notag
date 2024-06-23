@@ -1,18 +1,18 @@
-use std::{
-    ffi::{c_void, OsString},
-    path::{Path, PathBuf},
-};
+mod hooks;
+mod ue;
 
-use anyhow::{bail, Context, Result};
-use retour::static_detour;
-use windows::{
-    Win32::Foundation::*,
-    Win32::System::{
-        LibraryLoader::GetModuleHandleA,
-        Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS},
-        ProcessStatus::{GetModuleInformation, MODULEINFO},
+use std::{io::BufReader, path::Path};
+
+use anyhow::{Context, Result};
+use fs_err as fs;
+use hooks::{FnLoadGameFromMemory, FnSaveGameToMemory};
+use mint_lib::mod_info::Meta;
+use tracing::{info, warn};
+use windows::Win32::{
+    Foundation::HMODULE,
+    System::{
         SystemServices::*,
-        Threading::GetCurrentProcess,
+        Threading::{GetCurrentThread, QueueUserAPC},
     },
 };
 
@@ -38,7 +38,7 @@ extern "system" fn DllMain(dll_module: HMODULE, call_reason: u32, _: *mut ()) ->
     unsafe {
         match call_reason {
             DLL_PROCESS_ATTACH => {
-                std::thread::spawn(|| patch().ok());
+                QueueUserAPC(Some(init), GetCurrentThread(), 0);
             }
             DLL_PROCESS_DETACH => (),
             _ => (),
@@ -48,351 +48,119 @@ extern "system" fn DllMain(dll_module: HMODULE, call_reason: u32, _: *mut ()) ->
     }
 }
 
-// TODO refactor crate layout so this can be shared between the hook and integrator
-#[derive(Debug)]
-pub enum DRGInstallationType {
-    Steam,
-    Xbox,
+unsafe extern "system" fn init(_: usize) {
+    patch().ok();
 }
 
-impl DRGInstallationType {
-    pub fn from_exe_path() -> Result<Self> {
-        let exe_name = std::env::current_exe()
-            .context("could not determine running exe")?
-            .file_name()
-            .context("failed to get exe path")?
-            .to_string_lossy()
-            .to_lowercase();
-        Ok(match exe_name.as_str() {
-            "fsd-win64-shipping.exe" => Self::Steam,
-            "fsd-wingdk-shipping.exe" => Self::Xbox,
-            _ => bail!("unrecognized exe file name: {exe_name}"),
-        })
+static mut GLOBALS: Option<Globals> = None;
+static mut LOG_GUARD: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+
+pub struct Globals {
+    resolution: hook_resolvers::HookResolution,
+    meta: Meta,
+}
+
+impl Globals {
+    pub fn gmalloc(&self) -> &ue::FMalloc {
+        unsafe {
+            &**(self.resolution.core.as_ref().unwrap().gmalloc.0 as *const *const ue::FMalloc)
+        }
+    }
+    pub fn fframe_step(&self) -> ue::FnFFrameStep {
+        unsafe { std::mem::transmute(self.resolution.core.as_ref().unwrap().fframe_step.0) }
+    }
+    pub fn fframe_step_explicit_property(&self) -> ue::FnFFrameStepExplicitProperty {
+        unsafe {
+            std::mem::transmute(
+                self.resolution
+                    .core
+                    .as_ref()
+                    .unwrap()
+                    .fframe_step_explicit_property
+                    .0,
+            )
+        }
+    }
+    pub fn fname_to_string(&self) -> ue::FnFNameToString {
+        unsafe { std::mem::transmute(self.resolution.core.as_ref().unwrap().fnametostring.0) }
+    }
+    pub fn fname_ctor_wchar(&self) -> ue::FnFNameCtorWchar {
+        unsafe { std::mem::transmute(self.resolution.core.as_ref().unwrap().fname_ctor_wchar.0) }
+    }
+    pub fn uobject_base_utility_get_path_name(&self) -> ue::FnUObjectBaseUtilityGetPathName {
+        unsafe {
+            std::mem::transmute(
+                self.resolution
+                    .core
+                    .as_ref()
+                    .unwrap()
+                    .uobject_base_utility_get_path_name
+                    .0,
+            )
+        }
+    }
+    pub fn save_game_to_memory(&self) -> FnSaveGameToMemory {
+        unsafe {
+            std::mem::transmute(
+                self.resolution
+                    .save_game
+                    .as_ref()
+                    .unwrap()
+                    .save_game_to_memory
+                    .0,
+            )
+        }
+    }
+    pub fn load_game_from_memory(&self) -> FnLoadGameFromMemory {
+        unsafe {
+            std::mem::transmute(
+                self.resolution
+                    .save_game
+                    .as_ref()
+                    .unwrap()
+                    .load_game_from_memory
+                    .0,
+            )
+        }
     }
 }
 
+pub fn globals() -> &'static Globals {
+    unsafe { GLOBALS.as_ref().unwrap() }
+}
+
 unsafe fn patch() -> Result<()> {
-    let pak_path = std::env::current_exe()
-        .ok()
-        .as_deref()
-        .and_then(Path::parent)
+    let exe_path = std::env::current_exe().ok();
+    let bin_dir = exe_path.as_deref().and_then(Path::parent);
+
+    let guard = bin_dir
+        .and_then(|bin_dir| mint_lib::setup_logging(bin_dir.join("mint_hook.log"), "hook").ok());
+    if guard.is_none() {
+        warn!("failed to set up logging");
+    }
+
+    let pak_path = bin_dir
         .and_then(Path::parent)
         .and_then(Path::parent)
         .map(|p| p.join("Content/Paks/mods_P.pak"))
         .context("could not determine pak path")?;
-    if !pak_path.exists() {
-        return Ok(());
-    }
 
-    let installation_type = DRGInstallationType::from_exe_path()?;
+    let mut pak_reader = BufReader::new(fs::File::open(pak_path)?);
+    let pak = repak::PakBuilder::new().reader(&mut pak_reader)?;
 
-    let module = GetModuleHandleA(None).context("could not find main module")?;
-    let process = GetCurrentProcess();
+    let meta_buf = pak.get("meta", &mut pak_reader)?;
+    let meta: Meta = postcard::from_bytes(&meta_buf)?;
 
-    let mut mod_info = MODULEINFO::default();
-    GetModuleInformation(
-        process,
-        module,
-        &mut mod_info as *mut _,
-        std::mem::size_of::<MODULEINFO>() as u32,
-    );
+    let image = patternsleuth::process::internal::read_image()?;
+    let resolution = image.resolve(hook_resolvers::HookResolution::resolver())?;
+    info!("PS scan: {:#x?}", resolution);
 
-    let module_addr = mod_info.lpBaseOfDll;
+    GLOBALS = Some(Globals { resolution, meta });
+    LOG_GUARD = guard;
 
-    let memory = std::slice::from_raw_parts_mut(
-        mod_info.lpBaseOfDll as *mut u8,
-        mod_info.SizeOfImage as usize,
-    );
+    hooks::initialize()?;
 
-    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-    enum Sig {
-        GetServerName,
-        Disable,
-        SaveGameToSlot,
-        LoadGameFromMemory,
-        LoadGameFromSlot,
-        DoesSaveGameExist,
-    }
+    info!("hook initialized");
 
-    let patterns = [
-        (Sig::GetServerName, "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 83 EC 30 45 33 FF 4C 8B F2 48 8B D9 44 89 7C 24 50 41 8B FF"),
-        (Sig::Disable, "4C 8B B4 24 48 01 00 00 0F 84"),
-        (Sig::SaveGameToSlot, "48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 40 48 8b da 33 f6 48 8d 54 24 30 48 89 74 24 30 48 89 74 24 38 41 8b f8"),
-        (Sig::LoadGameFromMemory, "40 55 48 8d ac 24 00 ff ff ff 48 81 ec 00 02 00 00 83 79 08 00"),
-        (Sig::LoadGameFromSlot, "48 8b c4 55 57 48 8d a8 d8 fe ff ff 48 81 ec 18 02 00 00"),
-        (Sig::DoesSaveGameExist, "48 89 5C 24 08 57 48 83 EC 20 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B C8 4C 8B 00 41 FF 50 40 48 8B C8 48 85 C0 74 38 83 7B 08 00 74 17 48 8B 00 44 8B C7 48 8B 13 48 8B 5C 24 30 48 83 C4 20 5F 48 FF 60 08 48 8B 00 48 8D ?? ?? ?? ?? ?? 44 8B C7 48 8B 5C 24 30 48 83 C4 20 5F 48 FF 60 08 48 8B 5C 24 30 48 83 C4 20 5F C3"),
-    ].iter().map(|(name, pattern)| Ok((name, patternsleuth_scanner::Pattern::new(pattern)?))).collect::<Result<Vec<_>>>()?;
-    let pattern_refs = patterns
-        .iter()
-        .map(|(name, pattern)| (name, pattern))
-        .collect::<Vec<_>>();
-
-    let results = patternsleuth_scanner::scan_memchr_lookup(&pattern_refs, 0, memory);
-
-    let get_sig = |sig: Sig| {
-        results
-            .iter()
-            .find_map(|(s, addr)| (***s == sig).then_some(*addr))
-    };
-
-    if let Some(rva) = get_sig(Sig::GetServerName) {
-        let address = module_addr.add(rva);
-
-        Resize16 = Some(std::mem::transmute(address.add(53 + 4).offset(
-            i32::from_le_bytes(memory[rva + 53..rva + 53 + 4].try_into().unwrap()) as isize,
-        )));
-
-        let target: FnGetServerName = std::mem::transmute(address);
-        GetServerName
-            .initialize(target, get_server_name_detour)?
-            .enable()?;
-    }
-
-    if matches!(installation_type, DRGInstallationType::Steam) {
-        if let Some(rva) = get_sig(Sig::Disable) {
-            let patch = [0xB8, 0x01, 0x00, 0x00, 0x00];
-
-            let rva = rva + 29;
-            let patch_mem = &mut memory[rva..rva + 5];
-
-            let mut old: PAGE_PROTECTION_FLAGS = Default::default();
-            VirtualProtect(
-                patch_mem.as_ptr() as *const c_void,
-                patch_mem.len(),
-                PAGE_EXECUTE_READWRITE,
-                &mut old,
-            );
-
-            patch_mem.copy_from_slice(&patch);
-
-            VirtualProtect(
-                patch_mem.as_ptr() as *const c_void,
-                patch_mem.len(),
-                old,
-                &mut old,
-            );
-        }
-    }
-    if matches!(installation_type, DRGInstallationType::Xbox) {
-        SAVES_DIR = Some(
-            std::env::current_exe()
-                .ok()
-                .as_deref()
-                .and_then(Path::parent)
-                .and_then(Path::parent)
-                .and_then(Path::parent)
-                .context("could not determine save location")?
-                .join("Saved")
-                .join("SaveGames"),
-        );
-
-        if let Some(rva) = get_sig(Sig::SaveGameToSlot) {
-            let address = module_addr.add(rva);
-
-            SaveGameToMemory = Some(std::mem::transmute(address.add(39 + 4).offset(
-                i32::from_le_bytes(memory[rva + 39..rva + 39 + 4].try_into().unwrap()) as isize,
-            )));
-
-            let target: FnSaveGameToSlot = std::mem::transmute(address);
-            SaveGameToSlot
-                .initialize(target, save_game_to_slot_detour)?
-                .enable()?;
-        }
-
-        if let Some(rva) = get_sig(Sig::LoadGameFromMemory) {
-            let address = module_addr.add(rva);
-            LoadGameFromMemory = Some(std::mem::transmute(address));
-
-            if let Some(rva) = get_sig(Sig::LoadGameFromSlot) {
-                let address = module_addr.add(rva);
-
-                let target: FnLoadGameFromSlot = std::mem::transmute(address);
-                LoadGameFromSlot
-                    .initialize(target, load_game_from_slot_detour)?
-                    .enable()?;
-            }
-        }
-
-        if let Some(rva) = get_sig(Sig::DoesSaveGameExist) {
-            let address = module_addr.add(rva);
-
-            let target: FnDoesSaveGameExist = std::mem::transmute(address);
-            DoesSaveGameExist
-                .initialize(target, does_save_game_exist_detour)?
-                .enable()?;
-        }
-    }
     Ok(())
-}
-
-type FString = TArray<u16>;
-
-#[derive(Debug)]
-#[repr(C)]
-struct TArray<T> {
-    data: *const T,
-    num: i32,
-    max: i32,
-}
-
-#[repr(C)]
-struct USaveGame;
-
-impl<T> TArray<T> {
-    fn as_slice(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.data, self.num as usize) }
-    }
-    fn as_slice_mut(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.data as *mut _, self.num as usize) }
-    }
-    fn from_slice(slice: &[T]) -> TArray<T> {
-        TArray {
-            data: slice.as_ptr(),
-            num: slice.len() as i32,
-            max: slice.len() as i32,
-        }
-    }
-}
-
-impl FString {
-    fn to_os_string(&self) -> OsString {
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::ffi::OsStringExt;
-            let slice = self.as_slice();
-            let len = slice
-                .iter()
-                .enumerate()
-                .find_map(|(i, &b)| (b == 0).then_some(i))
-                .unwrap_or(slice.len());
-            std::ffi::OsString::from_wide(&slice[0..len])
-        }
-        #[cfg(not(target_os = "windows"))]
-        unimplemented!()
-    }
-}
-
-type FnResize16 = unsafe extern "system" fn(*const c_void, new_max: i32);
-type FnGetServerName = unsafe extern "system" fn(*const c_void, *const c_void) -> *const FString;
-type FnSaveGameToSlot = unsafe extern "system" fn(*const USaveGame, *const FString, i32) -> bool;
-type FnSaveGameToMemory = unsafe extern "system" fn(*const USaveGame, *mut TArray<u8>) -> bool;
-type FnLoadGameFromSlot = unsafe extern "system" fn(*const FString, i32) -> *const USaveGame;
-type FnLoadGameFromMemory = unsafe extern "system" fn(*const TArray<u8>) -> *const USaveGame;
-type FnDoesSaveGameExist = unsafe extern "system" fn(*const FString, i32) -> bool;
-
-static_detour! {
-    static GetServerName: unsafe extern "system" fn(*const c_void, *const c_void) -> *const FString;
-    static SaveGameToSlot: unsafe extern "system" fn(*const USaveGame, *const FString, i32) -> bool;
-    static LoadGameFromSlot: unsafe extern "system" fn(*const FString, i32) -> *const USaveGame;
-    static DoesSaveGameExist: unsafe extern "system" fn(*const FString, i32) -> bool;
-}
-
-#[allow(non_upper_case_globals)]
-static mut Resize16: Option<FnResize16> = None;
-#[allow(non_upper_case_globals)]
-static mut SaveGameToMemory: Option<FnSaveGameToMemory> = None;
-#[allow(non_upper_case_globals)]
-static mut LoadGameFromMemory: Option<FnLoadGameFromMemory> = None;
-
-static mut SAVES_DIR: Option<PathBuf> = None;
-
-fn get_path_for_slot(slot_name: &FString) -> Option<PathBuf> {
-    let mut str_path = slot_name.to_os_string();
-    str_path.push(".sav");
-
-    let path = std::path::Path::new(&str_path);
-    let mut normalized_path = unsafe { SAVES_DIR.as_ref() }?.clone();
-
-    for component in path.components() {
-        if let std::path::Component::Normal(c) = component {
-            normalized_path.push(c)
-        }
-    }
-
-    Some(normalized_path)
-}
-
-fn save_game_to_slot_detour(
-    save_game_object: *const USaveGame,
-    slot_name: *const FString,
-    user_index: i32,
-) -> bool {
-    unsafe {
-        let slot_name = &*slot_name;
-        if slot_name.to_os_string().to_string_lossy() == "Player" {
-            SaveGameToSlot.call(save_game_object, slot_name, user_index)
-        } else {
-            let mut data = TArray::<u8> {
-                data: std::ptr::null(),
-                num: 0,
-                max: 0,
-            };
-
-            if !SaveGameToMemory.unwrap()(save_game_object, &mut data) {
-                return false;
-            }
-
-            let Some(path) = get_path_for_slot(slot_name) else {
-                return false;
-            };
-
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-
-            std::fs::write(path, data.as_slice()).is_ok()
-        }
-    }
-}
-
-fn load_game_from_slot_detour(slot_name: *const FString, user_index: i32) -> *const USaveGame {
-    unsafe {
-        let slot_name = &*slot_name;
-        if slot_name.to_os_string().to_string_lossy() == "Player" {
-            LoadGameFromSlot.call(slot_name, user_index)
-        } else if let Some(data) =
-            get_path_for_slot(slot_name).and_then(|path| std::fs::read(path).ok())
-        {
-            // TODO this currently leaks the buffer but to free it we need to find the allocator
-            LoadGameFromMemory.unwrap()(&TArray::from_slice(data.as_slice()))
-        } else {
-            std::ptr::null()
-        }
-    }
-}
-
-fn does_save_game_exist_detour(slot_name: *const FString, user_index: i32) -> bool {
-    unsafe {
-        let slot_name = &*slot_name;
-        if slot_name.to_os_string().to_string_lossy() == "Player" {
-            DoesSaveGameExist.call(slot_name, user_index)
-        } else if let Some(path) = get_path_for_slot(slot_name) {
-            path.exists()
-        } else {
-            false
-        }
-    }
-}
-
-fn get_server_name_detour(a: *const c_void, b: *const c_void) -> *const FString {
-    unsafe {
-        let name: *mut FString = GetServerName.call(a, b) as *mut _;
-
-        let prefix = "".encode_utf16().collect::<Vec<_>>();
-        let old_num = (*name).num;
-
-        let new_num = (*name).num + prefix.len() as i32;
-        if (*name).max < new_num {
-            Resize16.unwrap()(name as *const c_void, new_num);
-            (*name).max = new_num;
-        }
-        (*name).num = new_num;
-
-        let memory = (*name).as_slice_mut();
-
-        memory.copy_within(0..old_num as usize, prefix.len());
-        memory[0..prefix.len()].copy_from_slice(&prefix);
-
-        name
-    }
 }

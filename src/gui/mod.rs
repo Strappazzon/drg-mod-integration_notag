@@ -6,58 +6,67 @@ mod toggle_switch;
 
 //#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, SystemTime};
+use std::ops::{Deref, RangeInclusive};
+use std::time::{Duration, Instant, SystemTime};
 use std::{
     collections::{HashMap, HashSet},
     ops::DerefMut,
     path::PathBuf,
 };
 
-use anyhow::{anyhow, Context, Result};
 use eframe::egui::{Button, CollapsingHeader, RichText, Visuals};
 use eframe::epaint::{Pos2, Vec2};
 use eframe::{
-    egui::{self, FontSelection, Layout, TextFormat, Ui},
+    egui::{FontSelection, Layout, TextFormat, Ui},
     emath::{Align, Align2},
     epaint::{text::LayoutJob, Color32, Stroke},
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use itertools::Itertools as _;
+use mint_lib::error::ResultExt as _;
+use mint_lib::mod_info::{ModioTags, RequiredStatus};
+use mint_lib::update::GitHubRelease;
+use strum::{EnumIter, IntoEnumIterator};
 use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 
+use crate::gui::find_string::searchable_text;
 use crate::mod_lints::{LintId, LintReport, SplitAssetPair};
+use crate::providers::ProviderError;
+use crate::state::SortingConfig;
 use crate::Dirs;
 use crate::{
     integrate::uninstall,
     is_drg_pak,
     providers::{
-        ApprovalStatus, FetchProgress, ModInfo, ModSpecification, ModStore, ModioTags,
-        ProviderFactory, RequiredStatus,
+        ApprovalStatus, FetchProgress, ModInfo, ModSpecification, ModStore, ProviderFactory,
     },
     state::{ModConfig, ModData_v0_1_0 as ModData, ModOrGroup, ModProfile, State},
+    MintError,
 };
-use find_string::FindString;
 use message::MessageHandle;
 use request_counter::{RequestCounter, RequestID};
 
 use self::toggle_switch::toggle_switch;
 
-pub fn gui(dirs: Dirs, args: Option<Vec<String>>) -> Result<()> {
+pub fn gui(dirs: Dirs, args: Option<Vec<String>>) -> Result<(), MintError> {
     let options = eframe::NativeOptions {
-        initial_window_size: Some(egui::vec2(800.0, 400.0)),
-        drag_and_drop_support: true,
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([900.0, 500.0])
+            .with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native(
-        &format!("DRG Mod Integration {}", env!("CARGO_PKG_VERSION")),
+        &format!("mint_notag {}", env!("CARGO_PKG_VERSION")),
         options,
         Box::new(|cc| Box::new(App::new(cc, dirs, args).unwrap())),
     )
-    .map_err(|e| anyhow!("{e}"))?;
+    .with_generic(|e| format!("{e}"))?;
     Ok(())
 }
 
@@ -86,6 +95,29 @@ impl GuiTheme {
     }
 }
 
+#[derive(PartialEq, Debug, EnumIter, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub enum SortBy {
+    Enabled,
+    Name,
+    Priority,
+    Provider,
+    RequiredStatus,
+    ApprovalCategory,
+}
+
+impl SortBy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SortBy::Enabled => "Enabled",
+            SortBy::Name => "Name",
+            SortBy::Priority => "Priority",
+            SortBy::Provider => "Provider",
+            SortBy::RequiredStatus => "Is Required",
+            SortBy::ApprovalCategory => "Approval",
+        }
+    }
+}
+
 const MODIO_LOGO_PNG: &[u8] = include_bytes!("../../assets/modio-cog-blue.png");
 
 pub struct App {
@@ -102,11 +134,12 @@ pub struct App {
     has_run_init: bool,
     request_counter: RequestCounter,
     window_provider_parameters: Option<WindowProviderParameters>,
-    search_string: Option<String>,
+    search_string: String,
     scroll_to_match: bool,
+    focus_search: bool,
     settings_window: Option<WindowSettings>,
     modio_texture_handle: Option<egui::TextureHandle>,
-    last_action_status: LastActionStatus,
+    last_action: Option<LastAction>,
     available_update: Option<GitHubRelease>,
     show_update_time: Option<SystemTime>,
     open_profiles: HashSet<String>,
@@ -119,6 +152,7 @@ pub struct App {
     needs_restart: bool,
     self_update_rid: Option<MessageHandle<SelfUpdateProgress>>,
     original_exe_path: Option<PathBuf>,
+    problematic_mod_id: Option<u32>,
 }
 
 #[derive(Default)]
@@ -135,18 +169,49 @@ struct LintOptions {
     unmodified_game_assets: bool,
 }
 
+struct LastAction {
+    timestamp: Instant,
+    status: LastActionStatus,
+}
+impl LastAction {
+    fn success(msg: String) -> Self {
+        Self {
+            timestamp: Instant::now(),
+            status: LastActionStatus::Success(msg),
+        }
+    }
+    fn failure(msg: String) -> Self {
+        Self {
+            timestamp: Instant::now(),
+            status: LastActionStatus::Failure(msg),
+        }
+    }
+    fn timeago(&self) -> String {
+        let duration = Instant::now().duration_since(self.timestamp);
+        let seconds = duration.as_secs();
+        if seconds < 60 {
+            format!("{}s ago", seconds)
+        } else if seconds < 3600 {
+            format!("{}m ago", seconds / 60)
+        } else {
+            ">1h ago".into()
+        }
+    }
+}
+
 enum LastActionStatus {
-    Idle,
     Success(String),
     Failure(String),
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext, dirs: Dirs, args: Option<Vec<String>>) -> Result<Self> {
+    fn new(
+        cc: &eframe::CreationContext,
+        dirs: Dirs,
+        args: Option<Vec<String>>,
+    ) -> Result<Self, MintError> {
         let (tx, rx) = mpsc::channel(10);
         let state = State::init(dirs)?;
-        info!("config dir = {}", state.dirs.config_dir.display());
-        info!("cache dir = {}", state.dirs.cache_dir.display());
 
         Ok(Self {
             default_visuals: cc
@@ -168,9 +233,10 @@ impl App {
             window_provider_parameters: None,
             search_string: Default::default(),
             scroll_to_match: false,
+            focus_search: false,
             settings_window: None,
             modio_texture_handle: None,
-            last_action_status: LastActionStatus::Idle,
+            last_action: None,
             available_update: None,
             show_update_time: None,
             open_profiles: Default::default(),
@@ -183,10 +249,13 @@ impl App {
             needs_restart: false,
             self_update_rid: None,
             original_exe_path: None,
+            problematic_mod_id: None,
         })
     }
 
     fn ui_profile(&mut self, ui: &mut Ui, profile: &str) {
+        let sorting_config = self.get_sorting_config();
+
         let ModData {
             profiles, groups, ..
         } = self.state.mod_data.deref_mut().deref_mut();
@@ -204,7 +273,7 @@ impl App {
             add_deps: None,
         };
 
-        let mut ui_profile = |ui: &mut Ui, profile: &mut ModProfile| {
+        let ui_profile = |ui: &mut Ui, profile: &mut ModProfile| {
             let enabled_specs = profile
                 .mods
                 .iter()
@@ -249,50 +318,27 @@ impl App {
                          ui: &mut Ui,
                          color: Option<egui::Color32>,
                          hover_str: Option<&str>| {
-                            let text_color = if color.is_some() {
-                                Color32::BLACK
-                            } else {
-                                Color32::GRAY
-                            };
-                            let mut job = LayoutJob::default();
-                            let mut is_match = false;
-                            if let Some(search_string) = &self.search_string {
-                                for (m, chunk) in
-                                    find_string::FindString::new(tag_str, search_string)
-                                {
-                                    let background = if m {
-                                        is_match = true;
-                                        TextFormat {
-                                            background: Color32::YELLOW,
-                                            color: text_color,
-                                            ..Default::default()
-                                        }
+                            let search = searchable_text(tag_str, &self.search_string, {
+                                TextFormat {
+                                    color: if color.is_some() {
+                                        Color32::BLACK
                                     } else {
-                                        TextFormat {
-                                            color: text_color,
-                                            ..Default::default()
-                                        }
-                                    };
-                                    job.append(chunk, 0.0, background);
-                                }
-                            } else {
-                                job.append(
-                                    tag_str,
-                                    0.0,
-                                    TextFormat {
-                                        color: text_color,
-                                        ..Default::default()
+                                        Color32::GRAY
                                     },
-                                );
-                            }
+
+                                    ..Default::default()
+                                }
+                            });
 
                             let button = if let Some(color) = color {
-                                egui::Button::new(job)
+                                egui::Button::new(search.job)
                                     .small()
                                     .fill(color)
                                     .stroke(egui::Stroke::NONE)
                             } else {
-                                egui::Button::new(job).small().stroke(egui::Stroke::NONE)
+                                egui::Button::new(search.job)
+                                    .small()
+                                    .stroke(egui::Stroke::NONE)
                             };
 
                             let res = if let Some(hover_str) = hover_str {
@@ -302,7 +348,7 @@ impl App {
                                 ui.add_enabled(false, button)
                             };
 
-                            if is_match && self.scroll_to_match {
+                            if search.is_match && self.scroll_to_match {
                                 res.scroll_to_me(None);
                                 ctx.scroll_to_match = false;
                             }
@@ -372,7 +418,7 @@ impl App {
             let mut ui_mod = |ctx: &mut Ctx,
                               ui: &mut Ui,
                               _group: Option<&str>,
-                              state: egui_dnd::ItemState,
+                              row_index: usize,
                               mc: &mut ModConfig| {
                 if !mc.enabled {
                     let vis = ui.visuals_mut();
@@ -399,6 +445,15 @@ impl App {
 
                 let info = self.state.store.get_mod_info(&mc.spec);
 
+                if let Some(ref info) = info
+                    && let Some(modio_id) = info.modio_id
+                    && self.problematic_mod_id.is_some_and(|id| id == modio_id)
+                {
+                    let icon = egui::Button::new(RichText::new("❌").color(Color32::WHITE))
+                        .fill(Color32::RED);
+                    ui.add_enabled(false, icon);
+                }
+
                 if mc.enabled {
                     if let Some(req) = &self.integrate_rid {
                         match req.state.get(&mc.spec) {
@@ -420,7 +475,7 @@ impl App {
                 }
 
                 if let Some(info) = &info {
-                    egui::ComboBox::from_id_source(state.index)
+                    egui::ComboBox::from_id_source(row_index)
                         .selected_text(
                             self.state
                                 .store
@@ -448,17 +503,54 @@ impl App {
                             }
                         });
 
+                    ui.scope(|ui| {
+                        ui.style_mut().spacing.interact_size.x = 30.;
+                        let dark = ui.visuals().dark_mode;
+                        match mc.priority.cmp(&0) {
+                            std::cmp::Ordering::Less => {
+                                ui.visuals_mut().override_text_color = Some(if dark {
+                                    Color32::LIGHT_RED
+                                } else {
+                                    Color32::DARK_RED
+                                });
+                            }
+                            std::cmp::Ordering::Greater => {
+                                ui.visuals_mut().override_text_color = Some(if dark {
+                                    Color32::LIGHT_GREEN
+                                } else {
+                                    Color32::DARK_GREEN
+                                });
+                            }
+                            _ => {}
+                        }
+                        ui.add(
+                            egui::DragValue::new(&mut mc.priority)
+                                .custom_formatter(|n, _| {
+                                    if n == 0. {
+                                        "-".to_string()
+                                    } else {
+                                        format!("{n}")
+                                    }
+                                })
+                                .speed(0.05)
+                                .clamp_range(RangeInclusive::new(-999, 999)),
+                        )
+                        .on_hover_text_at_pointer(
+                            "Load Priority\nIn case of asset conflict, mods with higher priority take precedent.\nCan have duplicate values.",
+                        );
+                    });
+
                     if ui
                         .button("📋")
                         .on_hover_text_at_pointer("copy URL")
                         .clicked()
                     {
-                        ui.output_mut(|o| o.copied_text = mc.spec.url.to_owned());
+                        ui.output_mut(|o| o.copied_text = mc.spec.url.to_string());
                     }
 
                     if mc.enabled {
                         let is_duplicate = enabled_specs.iter().any(|(i, spec)| {
-                            Some(state.index) != *i && info.spec.satisfies_dependency(spec)
+                            Some(row_index) != *i && info.spec.satisfies_dependency(spec)
                         });
                         if is_duplicate
                             && ui
@@ -469,7 +561,7 @@ impl App {
                                 .on_hover_text_at_pointer("remove duplicate")
                                 .clicked()
                         {
-                            ctx.btn_remove = Some(state.index);
+                            ctx.btn_remove = Some(row_index);
                         }
 
                         let missing_deps = info
@@ -499,25 +591,6 @@ impl App {
                         }
                     }
 
-                    let mut job = LayoutJob::default();
-                    let mut is_match = false;
-                    if let Some(search_string) = &self.search_string {
-                        for (m, chunk) in FindString::new(&info.name, search_string) {
-                            let background = if m {
-                                is_match = true;
-                                TextFormat {
-                                    background: Color32::YELLOW,
-                                    ..Default::default()
-                                }
-                            } else {
-                                Default::default()
-                            };
-                            job.append(chunk, 0.0, background);
-                        }
-                    } else {
-                        job.append(&info.name, 0.0, Default::default());
-                    }
-
                     match info.provider {
                         "modio" => {
                             let texture: &egui::TextureHandle =
@@ -534,7 +607,8 @@ impl App {
                                     ui.ctx()
                                         .load_texture("modio-logo", image, Default::default())
                                 });
-                            let mut img = egui::Image::new(texture, [16.0, 16.0]);
+                            let mut img =
+                                egui::Image::new(texture).fit_to_exact_size([16.0, 16.0].into());
                             if !mc.enabled {
                                 img = img.tint(Color32::LIGHT_RED);
                             }
@@ -549,8 +623,15 @@ impl App {
                         _ => unimplemented!("unimplemented provider kind"),
                     }
 
-                    let res = ui.hyperlink_to(job, &mc.spec.url);
-                    if is_match && self.scroll_to_match {
+                    let search = searchable_text(&info.name, &self.search_string, {
+                        TextFormat {
+                            color: ui.visuals().hyperlink_color,
+                            ..Default::default()
+                        }
+                    });
+
+                    let res = ui.hyperlink_to(search.job, &mc.spec.url);
+                    if search.is_match && self.scroll_to_match {
                         res.scroll_to_me(None);
                         ctx.scroll_to_match = false;
                     }
@@ -564,14 +645,26 @@ impl App {
                         .on_hover_text_at_pointer("Copy URL")
                         .clicked()
                     {
-                        ui.output_mut(|o| o.copied_text = mc.spec.url.to_owned());
+                        ui.output_mut(|o| o.copied_text = mc.spec.url.to_string());
                     }
-                    ui.hyperlink(&mc.spec.url);
+
+                    let search = searchable_text(&mc.spec.url, &self.search_string, {
+                        TextFormat {
+                            color: ui.visuals().hyperlink_color,
+                            ..Default::default()
+                        }
+                    });
+
+                    let res = ui.hyperlink_to(search.job, &mc.spec.url);
+                    if search.is_match && self.scroll_to_match {
+                        res.scroll_to_me(None);
+                        ctx.scroll_to_match = false;
+                    }
                 }
             };
 
             let mut ui_item =
-                |ctx: &mut Ctx, ui: &mut Ui, mc: &mut ModOrGroup, state: egui_dnd::ItemState| {
+                |ctx: &mut Ctx, ui: &mut Ui, mc: &mut ModOrGroup, row_index: usize| {
                     ui.scope(|ui| {
                         ui.visuals_mut().widgets.hovered.weak_bg_fill = colors::DARK_RED;
                         ui.visuals_mut().widgets.active.weak_bg_fill = colors::DARKER_RED;
@@ -580,13 +673,13 @@ impl App {
                             .on_hover_text_at_pointer("Delete mod")
                             .clicked()
                         {
-                            ctx.btn_remove = Some(state.index);
+                            ctx.btn_remove = Some(row_index);
                         };
                     });
 
                     match mc {
                         ModOrGroup::Individual(mc) => {
-                            ui_mod(ctx, ui, None, state, mc);
+                            ui_mod(ctx, ui, None, row_index, mc);
                         }
                         ModOrGroup::Group {
                             ref group_name,
@@ -607,50 +700,69 @@ impl App {
                                     .iter_mut()
                                     .enumerate()
                                 {
-                                    ui.horizontal(|ui| {
-                                        ui_mod(
-                                            ctx,
-                                            ui,
-                                            Some(group_name),
-                                            egui_dnd::ItemState {
-                                                index,
-                                                dragged: false,
-                                            },
-                                            m,
-                                        )
-                                    });
+                                    ui.horizontal(|ui| ui_mod(ctx, ui, Some(group_name), index, m));
                                 }
                             });
                         }
                     }
                 };
 
-            let res = egui_dnd::dnd(ui, ui.id()).show(
-                profile.mods.iter_mut().enumerate(),
-                |ui, (_index, item), handle, state| {
-                    let mut frame = egui::Frame::none();
-                    if state.dragged {
-                        frame.fill = ui.visuals().extreme_bg_color
-                    } else if state.index % 2 == 1 {
-                        frame.fill = ui.visuals().faint_bg_color
-                    }
-                    frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            handle.ui(ui, |ui| {
-                                ui.label("   ☰  ");
+            if let Some(sorting_config) = sorting_config {
+                let comp = sort_mods(sorting_config);
+                profile
+                    .mods
+                    .iter_mut()
+                    .map(|m| {
+                        // fetch ModInfo up front because doing it in the comparator is slow
+                        let ModOrGroup::Individual(mc) = m else {
+                            unimplemented!("Item is not Individual \n{:?}", m);
+                        };
+                        let info = self.state.store.get_mod_info(&mc.spec);
+                        (m, info)
+                    })
+                    .enumerate()
+                    .sorted_by(|a, b| comp((a.1 .0, a.1 .1.as_ref()), (b.1 .0, b.1 .1.as_ref())))
+                    .enumerate()
+                    .for_each(|(visual_index, (store_index, item))| {
+                        let mut frame = egui::Frame::none();
+                        if visual_index % 2 == 1 {
+                            frame.fill = ui.visuals().faint_bg_color
+                        }
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui_item(&mut ctx, ui, item.0, store_index);
                             });
-
-                            ui_item(&mut ctx, ui, item, state);
                         });
                     });
-                },
-            );
+            } else {
+                let res = egui_dnd::dnd(ui, ui.id())
+                    .with_mouse_config(egui_dnd::DragDropConfig::mouse())
+                    .show(
+                        profile.mods.iter_mut().enumerate(),
+                        |ui, (_index, item), handle, state| {
+                            let mut frame = egui::Frame::none();
+                            if state.dragged {
+                                frame.fill = ui.visuals().extreme_bg_color
+                            } else if state.index % 2 == 1 {
+                                frame.fill = ui.visuals().faint_bg_color
+                            }
+                            frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    handle.ui(ui, |ui| {
+                                        ui.label("   ☰  ");
+                                    });
 
-            if res.final_update().is_some() {
-                res.update_vec(&mut profile.mods);
-                ctx.needs_save = true;
+                                    ui_item(&mut ctx, ui, item, state.index);
+                                });
+                            });
+                        },
+                    );
+
+                if res.final_update().is_some() {
+                    res.update_vec(&mut profile.mods);
+                    ctx.needs_save = true;
+                }
             }
-
             if let Some(remove) = ctx.btn_remove {
                 profile.mods.remove(remove);
                 ctx.needs_save = true;
@@ -667,6 +779,7 @@ impl App {
 
         if let Some(add_deps) = ctx.add_deps {
             message::ResolveMods::send(self, ui.ctx(), add_deps, true);
+            self.problematic_mod_id = None;
         }
 
         self.scroll_to_match = ctx.scroll_to_match;
@@ -942,6 +1055,13 @@ impl App {
                         }
                         ui.end_row();
 
+                        let data_dir = &self.state.dirs.data_dir;
+                        ui.label("Data directory:");
+                        if ui.link(data_dir.display().to_string()).clicked() {
+                            opener::open(data_dir).ok();
+                        }
+                        ui.end_row();
+
                         ui.label("GUI theme:");
                         ui.horizontal(|ui| {
                             ui.horizontal(|ui| {
@@ -984,7 +1104,7 @@ impl App {
 
                 });
             if try_save {
-                if let Err(e) = is_drg_pak(&window.drg_pak_path).context("Is not valid DRG pak") {
+                if let Err(e) = is_drg_pak(&window.drg_pak_path) {
                     window.drg_pak_path_err = Some(e.to_string());
                 } else {
                     self.state.config.drg_pak_path = Some(PathBuf::from(
@@ -1133,7 +1253,7 @@ impl App {
                                 self.tx.clone(),
                                 ctx.clone(),
                             ));
-
+                            self.problematic_mod_id = None;
                             self.lint_report_window = Some(WindowLintReport);
                         }
                     });
@@ -1443,11 +1563,79 @@ impl App {
             }
         }
     }
+
+    fn get_sorting_config(&self) -> Option<SortingConfig> {
+        self.state.config.sorting_config.clone()
+    }
+
+    fn update_sorting_config(&mut self, sort_category: Option<SortBy>, is_ascending: bool) {
+        self.state.config.sorting_config = sort_category.map(|sort_category| SortingConfig {
+            sort_category,
+            is_ascending,
+        });
+        self.state.config.save().unwrap();
+    }
+}
+
+fn sort_mods(
+    config: SortingConfig,
+) -> impl Fn((&ModOrGroup, Option<&ModInfo>), (&ModOrGroup, Option<&ModInfo>)) -> Ordering {
+    move |(a, info_a), (b, info_b)| {
+        if matches!(a, ModOrGroup::Group { .. }) || matches!(b, ModOrGroup::Group { .. }) {
+            unimplemented!("Groups in sorting not implemented");
+        }
+
+        let ModOrGroup::Individual(mc_a) = a else {
+            debug!("Item is not Individual \n{:?}", a);
+            return Ordering::Equal;
+        };
+        let ModOrGroup::Individual(mc_b) = b else {
+            debug!("Item is not Individual \n{:?}", b);
+            return Ordering::Equal;
+        };
+
+        fn map_cmp<V, M, F>(a: &V, b: &V, map: F) -> Ordering
+        where
+            M: Ord,
+            F: Fn(&V) -> M,
+        {
+            map(a).cmp(&map(b))
+        }
+
+        let name_order = map_cmp(&(mc_a, info_a), &(mc_b, info_b), |(mc, info)| {
+            (info.map(|i| i.name.to_lowercase()), &mc.spec.url)
+        });
+        let provider_order = map_cmp(&info_a, &info_b, |info| info.map(|i| i.provider));
+        let approval_order = map_cmp(&info_a, &info_b, |info| {
+            info.and_then(|i| i.modio_tags.as_ref())
+                .map(|t| t.approval_status)
+        });
+        let required_order = map_cmp(&info_a, &info_b, |info| {
+            info.and_then(|i| i.modio_tags.as_ref())
+                .map(|t| std::cmp::Reverse(t.required_status))
+        });
+        let mut order = match config.sort_category {
+            SortBy::Enabled => mc_b.enabled.cmp(&mc_a.enabled),
+            SortBy::Name => name_order,
+            SortBy::Priority => mc_a.priority.cmp(&mc_b.priority),
+            SortBy::Provider => provider_order,
+            SortBy::RequiredStatus => required_order,
+            SortBy::ApprovalCategory => approval_order,
+        };
+
+        if config.is_ascending {
+            order = order.reverse();
+        }
+        if config.sort_category != SortBy::Name {
+            order = order.then(name_order);
+        }
+        order
+    }
 }
 
 struct WindowProviderParameters {
-    tx: Sender<(RequestID, Result<()>)>,
-    rx: Receiver<(RequestID, Result<()>)>,
+    tx: Sender<(RequestID, Result<(), ProviderError>)>,
+    rx: Receiver<(RequestID, Result<(), ProviderError>)>,
     check_rid: Option<(RequestID, JoinHandle<()>)>,
     check_error: Option<String>,
     factory: &'static ProviderFactory,
@@ -1581,24 +1769,33 @@ impl eframe::App for App {
                                 );
                             }
 
-                            let mut mods = Vec::new();
-                            let active_profile = self.state.mod_data.active_profile.clone();
-                            self.state
-                                .mod_data
-                                .for_each_enabled_mod(&active_profile, |mc| {
-                                    mods.push(mc.spec.clone());
-                                });
-
                             if button.clicked() {
-                                self.last_action_status = LastActionStatus::Idle;
+                                let mut mod_configs = Vec::new();
+                                let mut mods = Vec::new();
+                                let active_profile = self.state.mod_data.active_profile.clone();
+                                self.state
+                                    .mod_data
+                                    .for_each_enabled_mod(&active_profile, |mc| {
+                                        mod_configs.push(mc.clone());
+                                    });
+
+                                mod_configs.sort_by_key(|k| -k.priority);
+
+                                for config in mod_configs {
+                                    mods.push(config.spec.clone());
+                                }
+
+                                self.last_action = None;
                                 self.integrate_rid = Some(message::Integrate::send(
                                     &mut self.request_counter,
                                     self.state.store.clone(),
                                     mods,
                                     self.state.config.drg_pak_path.as_ref().unwrap().clone(),
+                                    self.state.config.deref().into(),
                                     self.tx.clone(),
                                     ctx.clone(),
                                 ));
+                                self.problematic_mod_id = None;
                             }
                         });
 
@@ -1610,7 +1807,7 @@ impl eframe::App for App {
                                 );
                             }
                             if button.clicked() {
-                                self.last_action_status = LastActionStatus::Idle;
+                                self.last_action = None;
                                 if let Some(pak_path) = &self.state.config.drg_pak_path {
                                     let mut mods = HashSet::default();
                                     let active_profile = self.state.mod_data.active_profile.clone();
@@ -1629,18 +1826,14 @@ impl eframe::App for App {
                                     );
 
                                     debug!("uninstalling mods: pak_path = {}", pak_path.display());
-                                    match uninstall(pak_path, mods) {
-                                        Ok(()) => {
-                                            self.last_action_status = LastActionStatus::Success(
-                                                "Successfully uninstalled mods".to_string(),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            self.last_action_status = LastActionStatus::Failure(
-                                                format!("Failed to uninstall mods: {e}"),
-                                            )
-                                        }
-                                    }
+                                    self.last_action = Some(match uninstall(pak_path, mods) {
+                                        Ok(()) => LastAction::success(
+                                            "Successfully uninstalled mods".to_string(),
+                                        ),
+                                        Err(e) => LastAction::failure(format!(
+                                            "Failed to uninstall mods: {e}"
+                                        )),
+                                    })
                                 }
                             }
                         });
@@ -1653,6 +1846,7 @@ impl eframe::App for App {
                             .clicked()
                         {
                             message::UpdateCache::send(self);
+                            self.problematic_mod_id = None;
                         }
                     },
                 );
@@ -1696,24 +1890,27 @@ impl eframe::App for App {
                     }
                 }
                 ui.with_layout(egui::Layout::left_to_right(Align::TOP), |ui| {
-                    match &self.last_action_status {
-                        LastActionStatus::Success(msg) => {
-                            ui.label(
-                                egui::RichText::new("STATUS")
-                                    .color(Color32::BLACK)
-                                    .background_color(Color32::LIGHT_GREEN),
-                            );
-                            ui.label(msg);
-                        }
-                        LastActionStatus::Failure(msg) => {
-                            ui.label(
-                                egui::RichText::new("STATUS")
-                                    .color(Color32::BLACK)
-                                    .background_color(Color32::LIGHT_RED),
-                            );
-                            ui.label(msg);
-                        }
-                        _ => {}
+                    if let Some(last_action) = &self.last_action {
+                        let msg = match &last_action.status {
+                            LastActionStatus::Success(msg) => {
+                                ui.label(
+                                    egui::RichText::new("STATUS")
+                                        .color(Color32::BLACK)
+                                        .background_color(Color32::LIGHT_GREEN),
+                                );
+                                msg
+                            }
+                            LastActionStatus::Failure(msg) => {
+                                ui.label(
+                                    egui::RichText::new("STATUS")
+                                        .color(Color32::BLACK)
+                                        .background_color(Color32::LIGHT_RED),
+                                );
+                                msg
+                            }
+                        };
+                        ui.ctx().request_repaint(); // for continuously updating time
+                        ui.label(format!("({}): {}", last_action.timeago(), msg));
                     }
                 });
             });
@@ -1790,15 +1987,44 @@ impl eframe::App for App {
                     );
                     if is_committed(&resolve) {
                         message::ResolveMods::send(self, ctx, self.parse_mods(), false);
+                        self.problematic_mod_id = None;
                     }
                 });
             });
 
             let profile = self.state.mod_data.active_profile.clone();
-            self.ui_profile(ui, &profile);
 
-            // TODO: actually implement mod groups.
-            if let Some(search_string) = &mut self.search_string {
+            ui.horizontal(|ui| {
+                ui.label("Sort by: ");
+
+                let (mut sort_category, mut is_ascending) = self
+                    .get_sorting_config()
+                    .map(|c| (Some(c.sort_category), c.is_ascending))
+                    .unwrap_or_default();
+
+                let mut clicked = ui.radio_value(&mut sort_category, None, "Manual").clicked();
+                for category in SortBy::iter() {
+                    let mut radio_label = category.as_str().to_owned();
+                    if sort_category == Some(category) {
+                        radio_label.push_str(if is_ascending { " ⏶" } else { " ⏷" });
+                    }
+                    let resp = ui.radio_value(&mut sort_category, Some(category), radio_label);
+                    if resp.clicked() {
+                        clicked = true;
+                        if resp.changed() {
+                            is_ascending = true;
+                        } else {
+                            is_ascending = !is_ascending;
+                        }
+                    };
+                }
+                if clicked {
+                    self.update_sorting_config(sort_category, is_ascending);
+                }
+
+                ui.add_space(16.);
+                // TODO: actually implement mod groups.
+                let search_string = &mut self.search_string;
                 let lower = search_string.to_lowercase();
                 let any_matches = self.state.mod_data.any_mod(&profile, |mc, _| {
                     self.state
@@ -1808,7 +2034,7 @@ impl eframe::App for App {
                         .unwrap_or(false)
                 });
 
-                let mut text_edit = egui::TextEdit::singleline(search_string);
+                let mut text_edit = egui::TextEdit::singleline(search_string).hint_text("Search");
                 if !any_matches {
                     text_edit = text_edit.text_color(ui.visuals().error_fg_color);
                 }
@@ -1818,14 +2044,24 @@ impl eframe::App for App {
                 if res.changed() {
                     self.scroll_to_match = true;
                 }
-                if res.lost_focus() {
-                    self.search_string = None;
+                if res.lost_focus()
+                    && ui.input(|i| {
+                        i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)
+                    })
+                {
+                    *search_string = String::new();
                     self.scroll_to_match = false;
-                } else if !res.has_focus() {
+                } else if self.focus_search {
                     res.request_focus();
+                    self.focus_search = false;
                 }
-            }
+            });
+            ui.add_space(4.);
 
+            self.ui_profile(ui, &profile);
+
+            // must access memory outside of input lock to prevent deadlock
+            let is_anything_focused = ctx.memory(|m| m.focus().is_some());
             ctx.input(|i| {
                 if !i.raw.dropped_files.is_empty()
                     && self.integrate_rid.is_none()
@@ -1844,6 +2080,7 @@ impl eframe::App for App {
 
                     self.resolve_mod = mods.trim().to_string();
                     message::ResolveMods::send(self, ctx, self.parse_mods(), false);
+                    self.problematic_mod_id = None;
                 }
                 for e in &i.events {
                     match e {
@@ -1851,16 +2088,17 @@ impl eframe::App for App {
                             if self.integrate_rid.is_none()
                                 && self.update_rid.is_none()
                                 && self.lint_rid.is_none()
-                                && ctx.memory(|m| m.focus().is_none())
+                                && !is_anything_focused
                             {
                                 self.resolve_mod = s.trim().to_string();
                                 message::ResolveMods::send(self, ctx, self.parse_mods(), false);
                             }
                         }
                         egui::Event::Text(text) => {
-                            if ctx.memory(|m| m.focus().is_none()) {
-                                self.search_string = Some(text.to_string());
+                            if !is_anything_focused {
+                                self.search_string = text.to_string();
                                 self.scroll_to_match = true;
+                                self.focus_search = true;
                             }
                         }
                         _ => {}
@@ -1918,13 +2156,6 @@ fn custom_popup_above_or_below_widget<R>(
     } else {
         None
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct GitHubRelease {
-    html_url: String,
-    tag_name: String,
-    body: String,
 }
 
 #[derive(Debug)]

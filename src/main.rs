@@ -1,19 +1,16 @@
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{debug, info};
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::filter;
 
-use drg_mod_integration_notag::mod_lints::{run_lints, LintId};
-use drg_mod_integration_notag::providers::ProviderFactory;
-use drg_mod_integration_notag::{gui::gui, providers::ModSpecification, state::State, DRGInstallation};
-use drg_mod_integration_notag::{
+use mint_notag::mod_lints::{run_lints, LintId};
+use mint_notag::providers::ProviderFactory;
+use mint_notag::{gui::gui, providers::ModSpecification, state::State};
+use mint_notag::{
     resolve_ordered_with_provider_init, resolve_unordered_and_integrate_with_provider_init, Dirs,
+    MintError,
 };
 
 /// Command line integration tool.
@@ -111,11 +108,16 @@ fn main() -> Result<()> {
         .appdata
         .as_ref()
         .map(Dirs::from_path)
-        .unwrap_or_else(Dirs::defauld_xdg)?;
+        .unwrap_or_else(Dirs::default_xdg)?;
 
     std::env::set_var("RUST_BACKTRACE", "1");
-    let _guard = setup_logging(&dirs)?;
+
+    let _guard = mint_lib::setup_logging(dirs.data_dir.join("mint.log"), "mint")?;
     debug!("logging setup complete");
+
+    info!("config dir = {}", dirs.config_dir.display());
+    info!("cache dir = {}", dirs.cache_dir.display());
+    info!("data dir = {}", dirs.data_dir.display());
 
     let rt = tokio::runtime::Runtime::new().expect("Unable to create Runtime");
     debug!("tokio runtime created");
@@ -153,67 +155,12 @@ fn main() -> Result<()> {
     }
 }
 
-fn setup_logging(dirs: &Dirs) -> Result<WorkerGuard> {
-    use tracing::metadata::LevelFilter;
-    use tracing::Level;
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{
-        field::RecordFields,
-        fmt::{
-            self,
-            format::{Pretty, Writer},
-            FormatFields,
-        },
-        EnvFilter,
-    };
-
-    /// Workaround for <https://github.com/tokio-rs/tracing/issues/1817>.
-    struct NewType(Pretty);
-
-    impl<'writer> FormatFields<'writer> for NewType {
-        fn format_fields<R: RecordFields>(
-            &self,
-            writer: Writer<'writer>,
-            fields: R,
-        ) -> core::fmt::Result {
-            self.0.format_fields(writer, fields)
-        }
-    }
-
-    let log_path = dirs.data_dir.join("drg-mod-integration.log");
-    let f = File::create(&log_path)?;
-    let writer = BufWriter::new(f);
-    let (log_file_appender, guard) = tracing_appender::non_blocking(writer);
-    let debug_file_log = fmt::layer()
-        .with_writer(log_file_appender)
-        .fmt_fields(NewType(Pretty::default()))
-        .with_ansi(false)
-        .with_filter(filter::Targets::new().with_target("drg_mod_integration", Level::DEBUG));
-    let stderr_log = fmt::layer()
-        .with_writer(std::io::stderr)
-        .compact()
-        .with_level(true)
-        .with_target(true)
-        .without_time()
-        .with_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        );
-    let subscriber = tracing_subscriber::registry()
-        .with(stderr_log)
-        .with(debug_file_log);
-
-    tracing::subscriber::set_global_default(subscriber)?;
-
-    debug!("tracing subscriber setup");
-    info!("writing logs to {:?}", log_path.display());
-
-    Ok(guard)
-}
-
 #[tracing::instrument(skip(state))]
-fn init_provider(state: &mut State, url: String, factory: &ProviderFactory) -> Result<()> {
+fn init_provider(
+    state: &mut State,
+    url: String,
+    factory: &ProviderFactory,
+) -> Result<(), MintError> {
     info!("initializing provider for {:?}", url);
 
     let params = state
@@ -232,21 +179,20 @@ fn init_provider(state: &mut State, url: String, factory: &ProviderFactory) -> R
             params.insert(p.id.to_owned(), value);
         }
     }
-    state.store.add_provider(factory, params)
+    Ok(state.store.add_provider(factory, params)?)
+}
+
+fn get_pak_path(state: &State, arg: &Option<PathBuf>) -> Result<PathBuf> {
+    arg.as_ref()
+        .or_else(|| state.config.drg_pak_path.as_ref())
+        .cloned()
+        .context("Could not find DRG pak file, please specify manually with the --fsd_pak flag")
 }
 
 async fn action_integrate(dirs: Dirs, action: ActionIntegrate) -> Result<()> {
-    let game_pak_path = action
-        .fsd_pak
-        .or_else(|| {
-            DRGInstallation::find()
-                .as_ref()
-                .map(DRGInstallation::main_pak)
-        })
-        .context("Could not find DRG pak file, please specify manually with the --fsd_pak flag")?;
-    debug!(?game_pak_path);
-
     let mut state = State::init(dirs)?;
+    let game_pak_path = get_pak_path(&state, &action.fsd_pak)?;
+    debug!(?game_pak_path);
 
     let mod_specs = action
         .mods
@@ -262,20 +208,13 @@ async fn action_integrate(dirs: Dirs, action: ActionIntegrate) -> Result<()> {
         init_provider,
     )
     .await
+    .map_err(|e| anyhow!("{}", e))
 }
 
 async fn action_integrate_profile(dirs: Dirs, action: ActionIntegrateProfile) -> Result<()> {
-    let game_pak_path = action
-        .fsd_pak
-        .or_else(|| {
-            DRGInstallation::find()
-                .as_ref()
-                .map(DRGInstallation::main_pak)
-        })
-        .context("Could not find DRG pak file, please specify manually with the --fsd_pak flag")?;
-    debug!(?game_pak_path);
-
     let mut state = State::init(dirs)?;
+    let game_pak_path = get_pak_path(&state, &action.fsd_pak)?;
+    debug!(?game_pak_path);
 
     let mut mods = Vec::new();
     state.mod_data.for_each_enabled_mod(&action.profile, |mc| {
@@ -290,20 +229,13 @@ async fn action_integrate_profile(dirs: Dirs, action: ActionIntegrateProfile) ->
         init_provider,
     )
     .await
+    .map_err(|e| anyhow!("{}", e))
 }
 
 async fn action_lint(dirs: Dirs, action: ActionLint) -> Result<()> {
-    let game_pak_path = action
-        .fsd_pak
-        .or_else(|| {
-            DRGInstallation::find()
-                .as_ref()
-                .map(DRGInstallation::main_pak)
-        })
-        .context("Could not find DRG pak file, please specify manually with the --fsd_pak flag")?;
-    debug!(?game_pak_path);
-
     let mut state = State::init(dirs)?;
+    let game_pak_path = get_pak_path(&state, &action.fsd_pak)?;
+    debug!(?game_pak_path);
 
     let mut mods = Vec::new();
     state.mod_data.for_each_mod(&action.profile, |mc| {
